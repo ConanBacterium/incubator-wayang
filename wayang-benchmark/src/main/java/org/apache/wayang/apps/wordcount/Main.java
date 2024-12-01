@@ -24,18 +24,108 @@ import org.apache.wayang.core.api.Configuration;
 import org.apache.wayang.core.api.WayangContext;
 import org.apache.wayang.core.plan.wayangplan.WayangPlan;
 import org.apache.wayang.core.util.ReflectionUtils;
+import org.apache.wayang.core.util.Tuple;
 import org.apache.wayang.java.Java;
 import org.apache.wayang.java.platform.JavaPlatform;
 import org.apache.wayang.spark.Spark;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.time.Duration;
+import java.time.Instant;
 
 public class Main {
+
+    private static long runExperiment1(String filePath, boolean isParquet, boolean isWordCount, WayangContext wayangContext)
+    {
+        /*
+         * Java always allocates objects on heap, so putting this out of loop and into function shouldn't help with memory leak.
+         */
+        Instant start = Instant.now();
+
+        JavaPlanBuilder planBuilder = new JavaPlanBuilder(wayangContext)
+                .withJobName("WordCount")
+                .withUdfJarOf(Main.class);  
+
+        Collection<Tuple2<String, Integer>> wordCounts;  
+
+        if(isParquet)
+        {
+            if(isWordCount)
+            {
+                wordCounts = planBuilder 
+                    // .readTextFile(args[1]).withName("Load file")
+                    .readParquetFile(filePath).withName("Load file")
+                    .flatMap(line -> Arrays.asList(line.split("\\W+")))
+                    .withSelectivity(1, 100, 0.9)
+                    .withName("Split words")
+                    .filter(token -> !token.isEmpty())
+                    .withName("Filter empty words")
+                    .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
+                    .reduceByKey(
+                            Tuple2::getField0,
+                            (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
+                    )
+                    .withName("Add counters")
+                    .collect();
+                // wordcountsParquet.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
+            } 
+            else 
+            {
+                planBuilder 
+                    // .readTextFile(args[1]).withName("Load file")
+                    .readParquetFile(filePath).withName("Load file")
+                    .collect(); 
+            }
+        }
+        else
+        {
+            if(isWordCount)
+            {
+                wordCounts = planBuilder 
+                    .readTextFile(filePath).withName("Load file")
+                    .flatMap(line -> Arrays.asList(line.split("\n")))
+                    .flatMap(line -> Arrays.asList(line.split(",")))
+                    .flatMap(val -> Arrays.asList(val.split("\\W+")))
+                    .withSelectivity(1, 100, 0.9)
+                    .withName("Split words")
+                    .filter(token -> !token.isEmpty())
+                    .withName("Filter empty words")
+                    .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
+                    .reduceByKey(
+                            Tuple2::getField0,
+                            (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
+                    )
+                    .withName("Add counters")
+                    .collect();
+                    // wordcountsParquet.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
+            } 
+            else 
+            {
+                planBuilder 
+                    .readTextFile(filePath).withName("Load file")
+                    .flatMap(line -> Arrays.asList(line.split("\n")))
+                    .map(line -> line.split(","))
+                    .collect(); 
+            }
+
+        }
+
+        Instant end = Instant.now();
+        long timeElapsed = Duration.between(start, end).toMillis();
+
+        planBuilder = null; 
+        wordCounts = null; 
+
+        return timeElapsed; 
+    }
 
     public static void main(String[] args) throws IOException, URISyntaxException {
         try {
@@ -60,41 +150,197 @@ public class Main {
                 }
             }
 
-            /* Get a plan builder */
-            JavaPlanBuilder planBuilder = new JavaPlanBuilder(wayangContext)
+            int nReps = Integer.parseInt(args[2]); 
+            boolean isWordCount = Boolean.parseBoolean(args[3]); 
+            boolean isParquet = Boolean.parseBoolean(args[4]); 
+
+            if(isWordCount){
+                System.out.println("wordcount");
+            } else {
+                System.out.println("file read only");
+            } 
+            if(isParquet) {
+                System.out.println("Parquet"); 
+            } else {
+                System.out.println("CSV"); 
+            }
+            
+
+            List<Long> executionTimes = new ArrayList<>();
+
+            // Do it once outside of repetition test... This way stuff should be hot in cache or smth 
+            JavaPlanBuilder planBuilderColdRun = new JavaPlanBuilder(wayangContext)
                     .withJobName("WordCount")
                     .withUdfJarOf(Main.class);
 
-            /* Start building the Apache WayangPlan */
-            Collection<Tuple2<String, Integer>> wordcounts = planBuilder
-                    /* Read the text file */
-                    .readTextFile(args[1]).withName("Load file")
-
-                    /* Split each line by non-word characters */
+            Collection<Tuple2<String, Integer>> wordcountsColdRun = planBuilderColdRun
+                    // .readTextFile(args[1]).withName("Load file")
+                    .readParquetFile(args[1]).withName("Load file")
                     .flatMap(line -> Arrays.asList(line.split("\\W+")))
                     .withSelectivity(1, 100, 0.9)
                     .withName("Split words")
-
-                    /* Filter empty tokens */
                     .filter(token -> !token.isEmpty())
                     .withName("Filter empty words")
-
-                    /* Attach counter to each word */
                     .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
-
-                    // Sum up counters for every word.
                     .reduceByKey(
                             Tuple2::getField0,
                             (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
                     )
                     .withName("Add counters")
-
-                    /* Execute the plan and collect the results */
                     .collect();
 
+            planBuilderColdRun = null; 
+            wordcountsColdRun = null; 
 
-            System.out.printf("Found %d words:\n", wordcounts.size());
-            wordcounts.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
+            for(int i = 0; i < nReps; i++)
+            {
+            /* 
+             *  THIS HAS MEMORY LEAK SOMEHOW !!!
+             * 
+                Instant start = Instant.now();
+
+                JavaPlanBuilder planBuilderParquet = new JavaPlanBuilder(wayangContext)
+                        .withJobName("WordCount")
+                        .withUdfJarOf(Main.class);  
+
+                Collection<Tuple2<String, Integer>> wordcountsParquet = planBuilderParquet
+                        // .readTextFile(args[1]).withName("Load file")
+                        .readParquetFile(args[1]).withName("Load file")
+                        .flatMap(line -> Arrays.asList(line.split("\\W+")))
+                        .withSelectivity(1, 100, 0.9)
+                        .withName("Split words")
+                        .filter(token -> !token.isEmpty())
+                        .withName("Filter empty words")
+                        .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
+                        .reduceByKey(
+                                Tuple2::getField0,
+                                (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
+                        )
+                        .withName("Add counters")
+                        .collect();
+                // wordcountsParquet.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
+
+                Instant end = Instant.now();
+                long timeElapsed = Duration.between(start, end).toMillis();
+                executionTimes.add(timeElapsed);
+                System.out.printf("Run %d: %d ms%n", i + 1, timeElapsed);
+                planBuilderParquet = null; 
+                wordcountsParquet = null; 
+                System.gc();
+                Thread.sleep(1000);
+             */
+
+                long time = runExperiment1(args[1], isParquet, isWordCount, wayangContext);
+                System.out.println(time); 
+                executionTimes.add(time); 
+                System.gc();
+                Thread.sleep(1000);
+            }
+
+            // Calculate statistics
+            double mean = executionTimes.stream()
+                    .mapToLong(Long::valueOf)
+                    .average()
+                    .orElse(0.0);
+
+            double variance = executionTimes.stream()
+                    .mapToDouble(time -> Math.pow(time - mean, 2))
+                    .average()
+                    .orElse(0.0);
+
+            double stdDev = Math.sqrt(variance);
+            double coefficientOfVariation= (stdDev / mean) * 100;
+
+            // Print summary statistics
+            System.out.println("\nBenchmark Results:");
+            System.out.printf("Mean execution time: %.2f ms%n", mean);
+            System.out.printf("Standard deviation: %.2f ms%n", stdDev);
+            System.out.printf("Coefficient of variation: %.2f%%%n", coefficientOfVariation);
+
+
+                // Collection<Tuple2<String, Integer>> wordcountsCsv = planBuilder
+                //         .readTextFile(args[1]).withName("Load file")
+                //         .flatMap(line -> Arrays.asList(line.split("\\W+")))
+                //         .withSelectivity(1, 100, 0.9)
+                //         .withName("Split words")
+                //         .filter(token -> !token.isEmpty())
+                //         .withName("Filter empty words")
+                //         .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
+                //         .reduceByKey(
+                //                 Tuple2::getField0,
+                //                 (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
+                //         )
+                //         .withName("Add counters")
+                //         .collect();
+                // // wordcountsParquet.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
+
+            // System.out.printf("Found %d words:\n", wordcounts.size());
+            // wordcounts.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
+                    /* Read the text file */
+                    // .readParquetFile(fileUrl).withName("Load file")
+                    // .flatMap(line -> Arrays.asList(line.split("\\s+")))
+                    // .withSelectivity(1, 100, 0.9)
+                    // .withName("Split words")
+
+                    // /* Filter empty tokens */
+                    // .filter(token -> !token.isEmpty())
+                    // .withName("Filter empty words")
+
+                    // /* Attach counter to each word */
+                    // .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
+
+                    // // // Sum up counters for every word.
+                    // .reduceByKey(
+                    //         Tuple2::getField0,
+                    //         (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
+                    // )
+                    // .withName("Add counters")
+
+                    // /* Execute the plan and collect the results */
+                    // .collect();
+
+
+
+            // Collection<Tuple2<String, Integer>> wordcounts = planBuilder
+                    // .flatMap((String line) -> Arrays.asList(line.split("\\s+"))) 
+                    // .map(String::toLowerCase)                          
+                    // .collect(Collectors.groupingBy(
+                    //     word -> word,                                  
+                    //     Collectors.counting()                          
+                    // ));
+
+
+                    // wordcounts.forEach((word, count) -> 
+                    // System.out.println(word + ": " + count));
+
+
+            //         // .readTextFile(args[1]).withName("Load file")
+
+            //         /* Split each line by non-word characters */
+            //         .flatMap(line -> Arrays.asList(line.split("\\W+")))
+            //         .withSelectivity(1, 100, 0.9)
+            //         .withName("Split words")
+
+            //         /* Filter empty tokens */
+            //         .filter(token -> !token.isEmpty())
+            //         .withName("Filter empty words")
+
+            //         /* Attach counter to each word */
+            //         .map(word -> new Tuple2<>(word.toLowerCase(), 1)).withName("To lower case, add counter")
+
+            //         // Sum up counters for every word.
+            //         .reduceByKey(
+            //                 Tuple2::getField0,
+            //                 (t1, t2) -> new Tuple2<>(t1.getField0(), t1.getField1() + t2.getField1())
+            //         )
+            //         .withName("Add counters")
+
+            //         /* Execute the plan and collect the results */
+            //         .collect();
+
+
+            // System.out.printf("Found %d words:\n", wordcounts.size());
+            // wordcounts.forEach(wc -> System.out.printf("%dx %s\n", wc.field1, wc.field0));
         } catch (Exception e) {
             System.err.println("App failed.");
             e.printStackTrace();
